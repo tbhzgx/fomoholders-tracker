@@ -1,0 +1,6 @@
+{
+    "tolerances": {
+        "token_amount_pct": 0.003
+    },
+    "max_holder_pages": 50
+}
