@@ -14,7 +14,6 @@ from dotenv import load_dotenv
 # Load .env from project root
 load_dotenv(Path(__file__).parent / ".env")
 
-from wallet_tracker.api.fomo import FomoClient, FOMO_NETWORK_IDS, FOMO_NETWORK_IDS_REVERSE
 from wallet_tracker.api.helius import HeliusClient
 from wallet_tracker.api.mobula import MobulaClient
 from wallet_tracker.config import Config
