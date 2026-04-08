@@ -1187,9 +1187,9 @@ def _fetch_fomo_user(username: str, config) -> tuple[dict, list[dict]]:
         fomo.close()
 
 
-def _fetch_fomo_holders(token_address: str, network_id: int, config) -> tuple[list[dict], int]:
+def _fetch_fomo_holders(token_address: str, network_id: int, config) -> tuple[list[dict], int, str | None]:
     """Fetch top 10 fomo holders for a token with PnL. Runs in thread.
-    Returns (holders, actual_network_id) — falls back to other chains if the
+    Returns (holders, actual_network_id, token_image_url) — falls back to other chains if the
     primary network_id returns no results."""
     fomo = _fomo_client_from_config(config)
     if not fomo:
@@ -1198,120 +1198,100 @@ def _fetch_fomo_holders(token_address: str, network_id: int, config) -> tuple[li
     if token_address.startswith("0x"):
         token_address = token_address.lower()
     try:
-        holders = fomo.get_token_holders_with_pnl(token_address, network_id, top_n=10)
+        holders, token_image = fomo.get_token_holders_with_pnl(token_address, network_id, top_n=10)
         if holders:
-            return holders, network_id
+            return holders, network_id, token_image
         # Fallback: try other supported chains
         for chain, nid in FOMO_NETWORK_IDS.items():
             if nid == network_id:
                 continue
-            holders = fomo.get_token_holders_with_pnl(token_address, nid, top_n=10)
+            holders, token_image = fomo.get_token_holders_with_pnl(token_address, nid, top_n=10)
             if holders:
-                return holders, nid
-        return [], network_id
+                return holders, nid, token_image
+        return [], network_id, None
     finally:
         fomo.close()
 
 
 def build_fomo_user_embeds(summary: dict) -> list[discord.Embed]:
-    """Build Discord embeds for a fomo user profile."""
-    embeds = []
-
+    """Build a single compact Discord embed for a fomo user profile."""
     user_id = summary.get("userId", "")
     sol = summary.get("solana_wallet")
     evm = summary.get("evm_wallet")
     realized = summary.get("totalRealizedPnlUsd", 0)
     unrealized = summary.get("totalUnrealizedPnlUsd", 0)
-    pnl_label = summary.get("pnl_label", "Realized PnL")
-    pnl24h = summary.get("pnl24h")
-    pnl7d = summary.get("pnl7d")
-    pnl30d = summary.get("pnl30d")
     pfp = summary.get("profilePictureLink")
     display = summary.get("displayName") or summary.get("userHandle") or user_id[:12]
     handle = summary.get("userHandle")
-    description = summary.get("description")
-    followers = summary.get("followers", 0)
-    following = summary.get("following", 0)
     volume = summary.get("totalVolume", 0)
 
-    # --- Profile embed ---
-    desc_parts = []
-    if description:
-        desc_parts.append(f"*{description}*")
-    if sol:
-        desc_parts.append(f"**Solana:** [Solscan]({_wallet_explorer_url(sol, FOMO_NETWORK_IDS['solana'])})\n`{sol}`")
-    if evm:
-        desc_parts.append(f"**EVM:** [Explorer]({_wallet_explorer_url(evm, FOMO_NETWORK_IDS['base'])})\n`{evm}`")
-    if handle:
-        desc_parts.append(f"**Twitter:** [@{handle}](https://x.com/{handle})")
-    desc_parts.append(f"**Followers:** {followers:,} | **Following:** {following:,}")
-
     pnl_color = discord.Color.green() if realized >= 0 else discord.Color.red()
-    profile_embed = discord.Embed(
-        title=f"Fomo Profile — {display}",
-        description="\n".join(desc_parts) if desc_parts else "No wallet data found.",
+    embed = discord.Embed(
+        title=f"Wallets & Holdings for {display}",
         color=pnl_color,
         url=f"https://fomo.family/trader/{user_id}",
     )
     if pfp:
-        profile_embed.set_thumbnail(url=pfp)
+        embed.set_thumbnail(url=pfp)
 
-    profile_embed.add_field(name=pnl_label, value=f"**${realized:,.2f}**", inline=True)
-    profile_embed.add_field(name="Unrealized PnL", value=f"**${unrealized:,.2f}**", inline=True)
-    if pnl24h is not None:
-        profile_embed.add_field(name="24h PnL", value=f"**${pnl24h:,.2f}**", inline=True)
-    if pnl7d is not None:
-        profile_embed.add_field(name="7d PnL", value=f"**${pnl7d:,.2f}**", inline=True)
-    if pnl30d is not None:
-        profile_embed.add_field(name="30d PnL", value=f"**${pnl30d:,.2f}**", inline=True)
-    profile_embed.add_field(
-        name="Trades",
-        value=f"{summary.get('active_count', 0)} active / {summary.get('closed_count', 0)} closed",
-        inline=True,
-    )
-    profile_embed.add_field(name="Total Volume", value=f"**${volume:,.2f}**", inline=True)
-    embeds.append(profile_embed)
+    # Wallets
+    if sol:
+        embed.add_field(
+            name="SOL Wallet",
+            value=f"`{sol}` [View]({_wallet_explorer_url(sol, FOMO_NETWORK_IDS['solana'])})",
+            inline=False,
+        )
+    if evm:
+        embed.add_field(
+            name="EVM Wallet",
+            value=f"`{evm}` [View]({_wallet_explorer_url(evm, FOMO_NETWORK_IDS['base'])})",
+            inline=False,
+        )
 
-    # --- Top holdings embed ---
+    # Top holdings
     top_holdings = summary.get("top_holdings", [])
     if top_holdings:
         lines = []
-        for t in top_holdings:
+        for i, t in enumerate(top_holdings, 1):
             sym = t.get("tokenMetadata", {}).get("symbol", "???")
             net = t.get("networkId", FOMO_NETWORK_IDS["solana"])
             addr = t.get("tokenAddress", "")
             cost = float(t.get("totalCostBasis") or 0)
             upnl = float(t.get("unrealizedPnlUsd") or 0)
+            sign = "+" if upnl >= 0 else ""
             ds_url = _token_dexscreener_url(addr, net)
-            lines.append(f"• [{sym}]({ds_url}) — In: **${cost:,.0f}** | uPnL: **${upnl:,.0f}**")
-        holdings_embed = discord.Embed(
-            title="Current Holdings",
-            description="\n".join(lines),
-            color=discord.Color.blue(),
-        )
-        embeds.append(holdings_embed)
+            lines.append(f"{i}. [{sym}]({ds_url}) — **${cost:,.0f}** ({sign}${upnl:,.0f})")
+        embed.add_field(name="🏆 Top Holdings", value="\n".join(lines), inline=False)
 
-    # --- Top closed trades embed ---
+    # Best closed trades
     top_closed = summary.get("top_closed", [])
     if top_closed:
         lines = []
-        for t in top_closed:
+        for i, t in enumerate(top_closed, 1):
             sym = t.get("tokenMetadata", {}).get("symbol", "???")
             net = t.get("networkId", FOMO_NETWORK_IDS["solana"])
             addr = t.get("tokenAddress", "")
-            cost = float(t.get("totalCostBasis") or 0)
             rpnl = float(t.get("realizedPnlUsd") or 0)
-            pct = (rpnl / cost * 100) if cost > 0 else 0
+            cost = float(t.get("totalCostBasis") or 0)
+            sign = "+" if rpnl >= 0 else ""
             ds_url = _token_dexscreener_url(addr, net)
-            lines.append(f"• [{sym}]({ds_url}) — In: **${cost:,.0f}** | PnL: **${rpnl:,.0f}** ({pct:,.0f}%)")
-        closed_embed = discord.Embed(
-            title="Best Closed Trades",
-            description="\n".join(lines),
-            color=discord.Color.gold(),
-        )
-        embeds.append(closed_embed)
+            lines.append(f"{i}. [{sym}]({ds_url}) — **${cost:,.0f}** ({sign}${rpnl:,.0f})")
+        embed.add_field(name="✅ Best Closed Trades", value="\n".join(lines), inline=False)
 
-    return embeds
+    # Stats line
+    r_sign = "+" if realized >= 0 else ""
+    u_sign = "+" if unrealized >= 0 else ""
+    embed.add_field(
+        name="💰 Cash Balance",
+        value=f"rPnL: **{r_sign}${realized:,.2f}** | uPnL: **{u_sign}${unrealized:,.2f}** | Vol: **${volume:,.0f}**",
+        inline=False,
+    )
+    if handle:
+        embed.set_footer(text=f"Twitter: @{handle} • fomo.family")
+    else:
+        embed.set_footer(text="fomo.family")
+
+    return [embed]
 
 
 def build_fomo_holders_embeds(
@@ -1320,25 +1300,10 @@ def build_fomo_holders_embeds(
     token_meta: dict,
     holders: list[dict],
 ) -> list[discord.Embed]:
-    """Build Discord embeds for fomo token holders."""
-    chain_name = FOMO_NETWORK_IDS_REVERSE.get(network_id, "unknown")
-    chain_icon = CHAIN_ICONS.get(chain_name, "")
+    """Build a single compact Discord embed for fomo token holders."""
     sym = token_meta.get("symbol", token_address[:8])
     ds_url = _token_dexscreener_url(token_address, network_id)
     token_image = token_meta.get("imageLargeUrl") or token_meta.get("thumbhash")
-
-    summary_embed = discord.Embed(
-        title=f"Fomo Holders — [{sym}]({ds_url})",
-        description=(
-            f"{chain_icon} **{chain_name.upper()}** | "
-            f"[View on DexScreener]({ds_url})\n"
-            f"Top {len(holders)} traders from fomo.family"
-        ),
-        color=discord.Color.og_blurple(),
-        url=ds_url,
-    )
-    if token_image and token_image.startswith("http"):
-        summary_embed.set_thumbnail(url=token_image)
 
     lines = []
     for i, h in enumerate(holders, 1):
@@ -1347,37 +1312,33 @@ def build_fomo_holders_embeds(
         net = h.get("networkId", network_id)
         wallet = h.get("solana_wallet") or h.get("evm_wallet")
 
-        # Build name part with links
-        if handle:
-            x_url = f"https://x.com/{handle}"
-            name_part = f"[{display}]({x_url})"
-        else:
-            name_part = f"**{display}**"
-
-        # Wallet explorer link + full address for copy-paste
-        if wallet:
-            explorer_url = _wallet_explorer_url(wallet, net)
-            wallet_part = f"[Explorer]({explorer_url})\n`{wallet}`"
-        else:
-            wallet_part = "*no wallet*"
+        name_part = f"[{display}](https://x.com/{handle})" if handle else f"**{display}**"
+        wallet_part = (
+            f"[{wallet[:4]}..{wallet[-4:]}]({_wallet_explorer_url(wallet, net)}) `{wallet}`"
+            if wallet else "*no wallet*"
+        )
 
         rpnl = h.get("realizedPnlUsd", 0)
         upnl = h.get("unrealizedPnlUsd", 0)
-        cost = h.get("totalCostBasis", 0)
-        holding = " (holding)" if h.get("stillHolding") else ""
-        pnl_sign = "+" if rpnl >= 0 else ""
+        r_sign = "+" if rpnl >= 0 else ""
+        u_sign = "+" if upnl >= 0 else ""
+        holding_dot = "🟢" if h.get("stillHolding") else "🔴"
 
         lines.append(
-            f"{i}. {name_part} | {wallet_part}\n"
-            f"   In: **${cost:,.0f}** | rPnL: **{pnl_sign}${rpnl:,.0f}** | uPnL: **${upnl:,.0f}**{holding}"
+            f"{i}. {name_part} {holding_dot} - **${rpnl:,.1f}** ({r_sign}${upnl:,.1f})\n"
+            f"   {wallet_part}"
         )
 
-    holders_embed = discord.Embed(
-        title=f"Top {len(holders)} Fomo Traders",
-        description="\n".join(lines) if lines else "No traders found.",
-        color=discord.Color.purple(),
+    embed = discord.Embed(
+        title=f"🏆 Top Fomo Holders for ${sym}",
+        description=f"Token: [{sym}]({ds_url}) `{token_address}`\n\n" + ("\n".join(lines) if lines else "No traders found."),
+        color=discord.Color.og_blurple(),
+        url=ds_url,
     )
-    return [summary_embed, holders_embed]
+    if token_image and token_image.startswith("http"):
+        embed.set_thumbnail(url=token_image)
+    embed.set_footer(text=f"Page 1 of 1 • fomobot")
+    return [embed]
 
 
 # ---------------------------------------------------------------------------
@@ -1482,13 +1443,13 @@ async def cmd_fomoholders(interaction: discord.Interaction, token: str):
             ))
             return
 
-        holders, actual_network_id = await asyncio.to_thread(
+        holders, actual_network_id, token_image = await asyncio.to_thread(
             _fetch_fomo_holders, token_info.mint_address, network_id, bot.config
         )
 
         token_meta = {
             "symbol": token_info.symbol,
-            "imageLargeUrl": getattr(token_info, "image_url", None),
+            "imageLargeUrl": token_image,
         }
         embeds = build_fomo_holders_embeds(
             token_info.mint_address, actual_network_id, token_meta, holders
