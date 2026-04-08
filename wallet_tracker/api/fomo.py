@@ -4,12 +4,11 @@ import time
 import warnings
 from typing import Any
 
-import cloudscraper
 import urllib3
 
 from .base import APIError, RateLimitError
 
-# Suppress SSL warnings for Cloudflare-proxied endpoints (self-signed intermediate cert)
+# Suppress SSL warnings (self-signed intermediate cert on Cloudflare-proxied endpoints)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
@@ -62,24 +61,24 @@ class FomoClient:
         self.installation_id = installation_id or "install_wallet_tracker"
         self._token_exp: float = self._parse_exp(bearer_token)
 
-        # cloudscraper handles Cloudflare JS challenges and cookies automatically.
-        # Cloudflare intermediate certs cause SSL verification errors on Windows with
-        # Python 3.14. CipherSuiteAdapter accepts an ssl_context kwarg — pass one
-        # with check_hostname=False and CERT_NONE to bypass verification entirely.
-        import ssl
-        from cloudscraper import CipherSuiteAdapter
+        # Use plain requests with SSL verification disabled.
+        # The Bearer JWT is what grants API access — cloudscraper's Cloudflare bypass
+        # is not needed and causes IP-level blocks when running server-side.
+        import ssl, requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.ssl_ import create_urllib3_context
 
-        _no_verify_ctx = ssl.create_default_context()
-        _no_verify_ctx.check_hostname = False
-        _no_verify_ctx.verify_mode = ssl.CERT_NONE
+        class _NoVerifyAdapter(HTTPAdapter):
+            def init_poolmanager(self, *args, **kwargs):
+                ctx = create_urllib3_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                kwargs["ssl_context"] = ctx
+                super().init_poolmanager(*args, **kwargs)
 
-        self._scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "ios", "mobile": True},
-        )
-        # Replace the mounted adapter with one using our no-verify SSL context
-        no_verify_adapter = CipherSuiteAdapter(ssl_context=_no_verify_ctx)
-        self._scraper.mount("https://", no_verify_adapter)
-        self._scraper.mount("http://", no_verify_adapter)
+        self._scraper = requests.Session()
+        self._scraper.mount("https://", _NoVerifyAdapter())
+        self._scraper.mount("http://", _NoVerifyAdapter())
 
     # ------------------------------------------------------------------
     # Token management
@@ -389,15 +388,16 @@ class FomoClient:
                      evmAddress, description, followers, following, numTrades,
                      totalVolume.
         """
-        # Use closedAt ordering to get the most recent trades — the API does not
-        # support true pagination (offset is ignored), so summing realizedPnlUsd
-        # across multiple pages produces inflated totals. One page of 25 recent
-        # closed trades gives the most accurate recent PnL figure.
+        # Fetch active trades and top closed trades by PnL (best lifetime trades).
+        # Also fetch most recent closed trades separately for an accurate recent PnL sum
+        # since the API ignores offset and always returns the same top results.
         active_result = self.get_user_trades(user_id, order_by="realizedPnlUsd", limit=25)
-        closed_result = self.get_user_trades(user_id, order_by="closedAt", limit=25)
+        top_closed_result = self.get_user_trades(user_id, order_by="realizedPnlUsd", limit=25)
+        recent_closed_result = self.get_user_trades(user_id, order_by="closedAt", limit=25)
         active = active_result.get("activeTrades", [])
-        closed = closed_result.get("closedTrades", [])
-        all_trades = [t["trade"] for t in active + closed if "trade" in t]
+        closed = top_closed_result.get("closedTrades", [])  # best lifetime trades for display
+        recent_closed = recent_closed_result.get("closedTrades", [])  # recent trades for PnL sum
+        all_trades = [t["trade"] for t in active + recent_closed if "trade" in t]
 
         # Derive wallet addresses from actual trade data first — the profile
         # address field is the linked/registered wallet which may be empty or
@@ -515,16 +515,18 @@ class FomoClient:
         token_address: str,
         network_id: int,
         top_n: int = 10,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], str | None]:
         """
         Get top N unique traders from a token's feed, enriched with their
         per-token PnL from /trades.
 
-        Each result has:
+        Returns (holders, token_image_url).
+
+        Each holder has:
             userId, displayName, userHandle, profilePictureLink,
             solana_wallet, evm_wallet, networkId,
             realizedPnlUsd, unrealizedPnlUsd, totalCostBasis,
-            avgEntryPrice, avgExitPrice, stillHolding, usdAmount
+            stillHolding, usdAmount
         """
         # Collect unique traders from feed (buy events first for entry prices)
         seen: dict[str, dict] = {}
@@ -543,9 +545,10 @@ class FomoClient:
                 break
 
         if not seen:
-            return []
+            return [], None
 
         # Enrich each trader with their per-token trade data
+        token_image_url: str | None = None
         enriched = []
         for uid, feed_item in list(seen.items())[:top_n * 3]:
             try:
@@ -557,6 +560,10 @@ class FomoClient:
                 [t["trade"] for t in trade_data.get("activeTrades", []) if "trade" in t]
                 + [t["trade"] for t in trade_data.get("closedTrades", []) if "trade" in t]
             )
+
+            # Grab token image from first trade that has it
+            if not token_image_url and all_token_trades:
+                token_image_url = all_token_trades[0].get("tokenMetadata", {}).get("imageLargeUrl")
 
             # Aggregate PnL across all positions for this token
             realized = sum(float(t.get("realizedPnlUsd") or 0) for t in all_token_trades)
@@ -593,7 +600,7 @@ class FomoClient:
 
         # Sort by realized PnL descending, return top N
         enriched.sort(key=lambda x: x["realizedPnlUsd"], reverse=True)
-        return enriched[:top_n]
+        return enriched[:top_n], token_image_url
 
     # ------------------------------------------------------------------
     # Leaderboard
