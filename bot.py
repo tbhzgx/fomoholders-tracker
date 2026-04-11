@@ -1147,6 +1147,30 @@ def _wallet_explorer_url(wallet: str, network_id: int) -> str:
         return f"https://bscscan.com/address/{wallet}"
 
 
+def _fetch_token_image_from_dexscreener(token_address: str, network_id: int) -> str | None:
+    """Fetch token image URL from DexScreener pair data."""
+    chain_slug = {
+        FOMO_NETWORK_IDS["solana"]: "solana",
+        FOMO_NETWORK_IDS["base"]: "base",
+        FOMO_NETWORK_IDS["bsc"]: "bsc",
+    }.get(network_id, "solana")
+    try:
+        import requests as _req
+        resp = _req.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+            timeout=8,
+        )
+        pairs = resp.json().get("pairs") or []
+        # Filter to matching chain, prefer highest liquidity pair
+        chain_pairs = [p for p in pairs if p.get("chainId") == chain_slug] or pairs
+        if not chain_pairs:
+            return None
+        best = sorted(chain_pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)[0]
+        return best.get("info", {}).get("imageUrl") or None
+    except Exception:
+        return None
+
+
 def _token_dexscreener_url(token_address: str, network_id: int) -> str:
     chain_slug = {
         FOMO_NETWORK_IDS["solana"]: "solana",
@@ -1188,9 +1212,9 @@ def _fetch_fomo_user(username: str, config) -> tuple[dict, list[dict]]:
 
 
 def _fetch_fomo_holders(token_address: str, network_id: int, config) -> tuple[list[dict], int, str | None]:
-    """Fetch top 10 fomo holders for a token with PnL. Runs in thread.
+    """Fetch all fomo holders for a token with PnL. Runs in thread.
     Returns (holders, actual_network_id, token_image_url) — falls back to other chains if the
-    primary network_id returns no results."""
+    primary network_id returns no results. Holders sorted by cost basis descending."""
     fomo = _fomo_client_from_config(config)
     if not fomo:
         raise ValueError("FOMO_BEARER_TOKEN not configured.")
@@ -1198,15 +1222,19 @@ def _fetch_fomo_holders(token_address: str, network_id: int, config) -> tuple[li
     if token_address.startswith("0x"):
         token_address = token_address.lower()
     try:
-        holders, token_image = fomo.get_token_holders_with_pnl(token_address, network_id, top_n=10)
+        holders, token_image = fomo.get_token_holders_with_pnl(token_address, network_id)
         if holders:
+            if not token_image:
+                token_image = _fetch_token_image_from_dexscreener(token_address, network_id)
             return holders, network_id, token_image
         # Fallback: try other supported chains
         for chain, nid in FOMO_NETWORK_IDS.items():
             if nid == network_id:
                 continue
-            holders, token_image = fomo.get_token_holders_with_pnl(token_address, nid, top_n=10)
+            holders, token_image = fomo.get_token_holders_with_pnl(token_address, nid)
             if holders:
+                if not token_image:
+                    token_image = _fetch_token_image_from_dexscreener(token_address, nid)
                 return holders, nid, token_image
         return [], network_id, None
     finally:
@@ -1218,6 +1246,8 @@ def build_fomo_user_embeds(summary: dict) -> list[discord.Embed]:
     user_id = summary.get("userId", "")
     sol = summary.get("solana_wallet")
     evm = summary.get("evm_wallet")
+    extra_sol = summary.get("extra_solana_wallet")
+    extra_evm = summary.get("extra_evm_wallet")
     realized = summary.get("totalRealizedPnlUsd", 0)
     unrealized = summary.get("totalUnrealizedPnlUsd", 0)
     pfp = summary.get("profilePictureLink")
@@ -1241,10 +1271,22 @@ def build_fomo_user_embeds(summary: dict) -> list[discord.Embed]:
             value=f"`{sol}` [View]({_wallet_explorer_url(sol, FOMO_NETWORK_IDS['solana'])})",
             inline=False,
         )
+    if extra_sol:
+        embed.add_field(
+            name="SOL Wallet (linked)",
+            value=f"`{extra_sol}` [View]({_wallet_explorer_url(extra_sol, FOMO_NETWORK_IDS['solana'])})",
+            inline=False,
+        )
     if evm:
         embed.add_field(
             name="EVM Wallet",
             value=f"`{evm}` [View]({_wallet_explorer_url(evm, FOMO_NETWORK_IDS['base'])})",
+            inline=False,
+        )
+    if extra_evm:
+        embed.add_field(
+            name="EVM Wallet (linked)",
+            value=f"`{extra_evm}` [View]({_wallet_explorer_url(extra_evm, FOMO_NETWORK_IDS['base'])})",
             inline=False,
         )
 
@@ -1294,19 +1336,26 @@ def build_fomo_user_embeds(summary: dict) -> list[discord.Embed]:
     return [embed]
 
 
-def build_fomo_holders_embeds(
+PAGE_SIZE = 10
+
+def build_fomo_holders_embed(
     token_address: str,
     network_id: int,
     token_meta: dict,
     holders: list[dict],
-) -> list[discord.Embed]:
-    """Build a single compact Discord embed for fomo token holders."""
+    page: int = 0,
+) -> discord.Embed:
+    """Build one page embed of fomo token holders (10 per page)."""
     sym = token_meta.get("symbol", token_address[:8])
     ds_url = _token_dexscreener_url(token_address, network_id)
-    token_image = token_meta.get("imageLargeUrl") or token_meta.get("thumbhash")
+    token_image = token_meta.get("imageLargeUrl")
+    total_pages = max(1, (len(holders) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    page_holders = holders[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+    start_rank = page * PAGE_SIZE + 1
 
     lines = []
-    for i, h in enumerate(holders, 1):
+    for i, h in enumerate(page_holders, start_rank):
         display = h.get("displayName") or f"User {i}"
         handle = h.get("userHandle")
         net = h.get("networkId", network_id)
@@ -1314,18 +1363,17 @@ def build_fomo_holders_embeds(
 
         name_part = f"[{display}](https://x.com/{handle})" if handle else f"**{display}**"
         wallet_part = (
-            f"[{wallet[:4]}..{wallet[-4:]}]({_wallet_explorer_url(wallet, net)}) `{wallet}`"
+            f"`{wallet}` [View]({_wallet_explorer_url(wallet, net)})"
             if wallet else "*no wallet*"
         )
 
-        rpnl = h.get("realizedPnlUsd", 0)
         upnl = h.get("unrealizedPnlUsd", 0)
-        r_sign = "+" if rpnl >= 0 else ""
+        position_value = h.get("positionValue") or (h.get("totalCostBasis", 0) + upnl)
         u_sign = "+" if upnl >= 0 else ""
         holding_dot = "🟢" if h.get("stillHolding") else "🔴"
 
         lines.append(
-            f"{i}. {name_part} {holding_dot} - **${rpnl:,.1f}** ({r_sign}${upnl:,.1f})\n"
+            f"{i}. {name_part} {holding_dot} - **${position_value:,.0f}** ({u_sign}${upnl:,.0f})\n"
             f"   {wallet_part}"
         )
 
@@ -1337,8 +1385,43 @@ def build_fomo_holders_embeds(
     )
     if token_image and token_image.startswith("http"):
         embed.set_thumbnail(url=token_image)
-    embed.set_footer(text=f"Page 1 of 1 • fomobot")
-    return [embed]
+    embed.set_footer(text=f"Page {page + 1} of {total_pages} • fomobot")
+    return embed
+
+
+class FomoHoldersView(discord.ui.View):
+    """Pagination buttons for /fomoholders."""
+
+    def __init__(self, token_address: str, network_id: int, token_meta: dict, holders: list[dict]):
+        super().__init__(timeout=300)
+        self.token_address = token_address
+        self.network_id = network_id
+        self.token_meta = token_meta
+        self.holders = holders
+        self.page = 0
+        self.total_pages = max(1, (len(holders) + PAGE_SIZE - 1) // PAGE_SIZE)
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.prev_button.disabled = self.page == 0
+        self.next_button.disabled = self.page >= self.total_pages - 1
+
+    def current_embed(self) -> discord.Embed:
+        return build_fomo_holders_embed(
+            self.token_address, self.network_id, self.token_meta, self.holders, self.page
+        )
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.page -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.page += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
 
 
 # ---------------------------------------------------------------------------
@@ -1451,13 +1534,121 @@ async def cmd_fomoholders(interaction: discord.Interaction, token: str):
             "symbol": token_info.symbol,
             "imageLargeUrl": token_image,
         }
-        embeds = build_fomo_holders_embeds(
-            token_info.mint_address, actual_network_id, token_meta, holders
-        )
-        await interaction.followup.send(embeds=embeds)
+        if not holders:
+            await interaction.followup.send(embed=discord.Embed(
+                title="No Fomo Traders Found",
+                description=f"No fomo.family traders found for this token.",
+                color=discord.Color.orange(),
+            ))
+            return
+        view = FomoHoldersView(token_info.mint_address, actual_network_id, token_meta, holders)
+        await interaction.followup.send(embed=view.current_embed(), view=view)
 
     except Exception as e:
         logger.exception("Error in /fomoholders")
+        await interaction.followup.send(embed=discord.Embed(
+            title="Error", description=f"```\n{str(e)[:3900]}\n```", color=discord.Color.red(),
+        ))
+
+
+# ---------------------------------------------------------------------------
+# /fomocomments command
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(
+    name="fomocomments",
+    description="Show fomo.family holder comments/thesis for a token",
+)
+@app_commands.describe(token="Token contract address or ticker")
+async def cmd_fomocomments(interaction: discord.Interaction, token: str):
+    await interaction.response.defer()
+    try:
+        if not bot.config.fomo_bearer_token:
+            await interaction.followup.send(embed=discord.Embed(
+                title="Missing Config",
+                description="FOMO_BEARER_TOKEN not set in .env",
+                color=discord.Color.red(),
+            ))
+            return
+
+        token_input = token.strip()
+        address_type = detect_chain_from_address(token_input)
+
+        resolver = TokenResolver()
+        try:
+            if address_type in ("solana", "evm"):
+                token_info = await asyncio.to_thread(resolver.get_by_mint_address, token_input)
+            else:
+                candidates = await asyncio.to_thread(resolver.search_by_ticker, token_input.upper())
+                token_info = candidates[0] if candidates else None
+        finally:
+            resolver.close()
+
+        if not token_info:
+            await interaction.followup.send(embed=discord.Embed(
+                title="Token Not Found",
+                description=f"Could not resolve `{token_input}`",
+                color=discord.Color.red(),
+            ))
+            return
+
+        network_id = FOMO_NETWORK_IDS.get(token_info.chain)
+        if not network_id:
+            await interaction.followup.send(embed=discord.Embed(
+                title="Unsupported Chain",
+                description=f"Chain `{token_info.chain}` is not supported by fomo.family.",
+                color=discord.Color.red(),
+            ))
+            return
+
+        mint = token_info.mint_address
+        if mint.startswith("0x"):
+            mint = mint.lower()
+
+        def _fetch():
+            fomo = _fomo_client_from_config(bot.config)
+            try:
+                return fomo.get_token_comments(mint, network_id)
+            finally:
+                fomo.close()
+
+        comments = await asyncio.to_thread(_fetch)
+
+        sym = token_info.symbol
+        ds_url = _token_dexscreener_url(mint, network_id)
+
+        if not comments:
+            await interaction.followup.send(embed=discord.Embed(
+                title=f"No Comments for ${sym}",
+                description="No holder comments found on fomo.family.",
+                color=discord.Color.orange(),
+            ))
+            return
+
+        lines = []
+        for c in comments[:15]:
+            handle = c.get("userHandle")
+            display = c.get("displayName") or handle or "unknown"
+            name_part = f"[{display}](https://x.com/{handle})" if handle else f"**{display}**"
+            pos = c.get("positionValue", 0)
+            likes = c.get("numLikes", 0)
+            text = c.get("comment", "").strip()
+            # Truncate long comments
+            if len(text) > 200:
+                text = text[:197] + "..."
+            lines.append(f"{name_part} (**${pos:,.0f}**) — {likes} ❤️\n> {text}\n")
+
+        embed = discord.Embed(
+            title=f"💬 Holder Comments for ${sym}",
+            description=f"[{sym}]({ds_url}) `{mint}`\n\n" + "\n".join(lines),
+            color=discord.Color.blurple(),
+            url=ds_url,
+        )
+        embed.set_footer(text=f"Top {len(comments[:15])} comments by likes • fomobot")
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        logger.exception("Error in /fomocomments")
         await interaction.followup.send(embed=discord.Embed(
             title="Error", description=f"```\n{str(e)[:3900]}\n```", color=discord.Color.red(),
         ))
