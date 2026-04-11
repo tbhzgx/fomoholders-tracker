@@ -369,6 +369,36 @@ class FomoClient:
         data = self.get("/v2/users/fuzzy-search", params={"searchTerm": search_term})
         return data.get("responseObject", {}).get("users", [])
 
+    def get_user_wallets(self, user_id: str) -> tuple[set[str], set[str]]:
+        """
+        Fetch all wallets linked to a user via /v2/users/{id}/balances.
+        Returns (solana_wallets, evm_wallets) as sets of addresses.
+        This is more reliable than trade data as it reflects all connected wallets.
+        """
+        try:
+            data = self.get(f"/v2/users/{user_id}/balances")
+            balances = data.get("responseObject", {}).get("balances", [])
+        except Exception:
+            return set(), set()
+
+        sol_wallets: set[str] = set()
+        evm_wallets: set[str] = set()
+        for item in balances:
+            addr = item.get("balance", {}).get("address", "")
+            wallet_id = item.get("balance", {}).get("walletId", "")
+            # walletId format: "{address}:{networkId}"
+            network_id_str = wallet_id.split(":")[-1] if ":" in wallet_id else ""
+            try:
+                nid = int(network_id_str)
+            except ValueError:
+                nid = 0
+            if addr:
+                if nid == FOMO_NETWORK_IDS["solana"]:
+                    sol_wallets.add(addr)
+                elif nid in (FOMO_NETWORK_IDS["base"], FOMO_NETWORK_IDS["bsc"]):
+                    evm_wallets.add(addr)
+        return sol_wallets, evm_wallets
+
     # ------------------------------------------------------------------
     # User profile (built from trade data — no dedicated profile endpoint)
     # ------------------------------------------------------------------
@@ -414,23 +444,39 @@ class FomoClient:
         total_unrealized = 0.0
         pnl_label = "30d PnL" if use_profile_pnl else "Recent PnL"
 
+        trade_solana_wallet: str | None = None
+        trade_evm_wallet: str | None = None
+
         for trade in all_trades:
             addr = trade.get("userAddress", "")
             net = trade.get("networkId")
-            if not solana_wallet and addr and net == FOMO_NETWORK_IDS["solana"]:
-                solana_wallet = addr
-            elif not evm_wallet and addr and net in (FOMO_NETWORK_IDS["base"], FOMO_NETWORK_IDS["bsc"]):
-                evm_wallet = addr
+            if not trade_solana_wallet and addr and net == FOMO_NETWORK_IDS["solana"]:
+                trade_solana_wallet = addr
+            elif not trade_evm_wallet and addr and net in (FOMO_NETWORK_IDS["base"], FOMO_NETWORK_IDS["bsc"]):
+                trade_evm_wallet = addr
             total_unrealized += float(trade.get("unrealizedPnlUsd") or 0)
             # Only sum realized from trades if profile has no pre-computed PnL
             if not use_profile_pnl:
                 total_realized += float(trade.get("realizedPnlUsd") or 0)
 
-        # Fall back to profile addresses if not found in trades
-        if not solana_wallet:
-            solana_wallet = (profile or {}).get("address")
-        if not evm_wallet:
-            evm_wallet = (profile or {}).get("evmAddress")
+        profile_solana = p.get("address")
+        profile_evm = p.get("evmAddress")
+
+        # Use /v2/users/{id}/balances as primary wallet source — most accurate,
+        # reflects all connected wallets including ones not seen in recent trades.
+        balance_sol_wallets, balance_evm_wallets = self.get_user_wallets(user_id)
+        balance_solana = next(iter(balance_sol_wallets), None)
+        balance_evm = next(iter(balance_evm_wallets), None)
+
+        # Priority: balances endpoint > trade wallet > profile address
+        solana_wallet = balance_solana or trade_solana_wallet or profile_solana
+        evm_wallet = balance_evm or trade_evm_wallet or profile_evm
+
+        # Collect all unique extra wallets to surface
+        all_sol = {w for w in [balance_solana, trade_solana_wallet, profile_solana] if w}
+        all_evm = {w for w in [balance_evm, trade_evm_wallet, profile_evm] if w}
+        extra_solana = next((w for w in all_sol if w != solana_wallet), None)
+        extra_evm = next((w for w in all_evm if w != evm_wallet), None)
 
         # Top holdings deduped by symbol, sorted by cost basis
         seen_syms: set[str] = set()
@@ -474,6 +520,8 @@ class FomoClient:
             "totalVolume": p.get("totalVolume", 0),
             "solana_wallet": solana_wallet,
             "evm_wallet": evm_wallet,
+            "extra_solana_wallet": extra_solana,
+            "extra_evm_wallet": extra_evm,
             "totalRealizedPnlUsd": total_realized,
             "totalUnrealizedPnlUsd": total_unrealized,
             "pnl_label": pnl_label,
@@ -507,18 +555,17 @@ class FomoClient:
         return {}
 
     # ------------------------------------------------------------------
-    # Token holders (from feed)
+    # Token holders (via /hodlers/top)
     # ------------------------------------------------------------------
 
     def get_token_holders_with_pnl(
         self,
         token_address: str,
         network_id: int,
-        top_n: int = 10,
     ) -> tuple[list[dict[str, Any]], str | None]:
         """
-        Get top N unique traders from a token's feed, enriched with their
-        per-token PnL from /trades.
+        Get all fomo holders for a token using the /hodlers/top endpoint.
+        Already sorted by current position value descending.
 
         Returns (holders, token_image_url).
 
@@ -526,81 +573,128 @@ class FomoClient:
             userId, displayName, userHandle, profilePictureLink,
             solana_wallet, evm_wallet, networkId,
             realizedPnlUsd, unrealizedPnlUsd, totalCostBasis,
-            stillHolding, usdAmount
+            positionValue, stillHolding
         """
-        # Collect unique traders from feed (buy events first for entry prices)
-        seen: dict[str, dict] = {}
-        cursor = None
-
-        for _ in range(10):  # max 10 pages to find top_n unique users
-            result = self.get_token_feed(token_address, network_id, limit=50, cursor=cursor)
-            for item in result.get("items", []):
-                uid = item.get("userId")
-                if uid and uid not in seen:
-                    seen[uid] = item
-                if len(seen) >= top_n * 3:  # gather 3x to filter by PnL
-                    break
-            cursor = result.get("nextCursor")
-            if not cursor or len(seen) >= top_n * 3:
-                break
-
-        if not seen:
+        import json as _json
+        tokens_param = _json.dumps([{"address": token_address, "networkId": network_id}])
+        data = self.get("/hodlers/top", params={"tokens": tokens_param})
+        results = data.get("responseObject", [])
+        if not results:
             return [], None
 
-        # Enrich each trader with their per-token trade data
-        token_image_url: str | None = None
+        result_obj = results[0]
+        top_holders = result_obj.get("topHolders", [])
+        if not top_holders:
+            return [], None
+
+        # Pull token image from the response object
+        token_data = result_obj.get("token") or result_obj.get("tokenMetadata") or {}
+        token_image_url: str | None = (
+            token_data.get("imageLargeUrl")
+            or token_data.get("imageUrl")
+            or token_data.get("image")
+            or result_obj.get("imageLargeUrl")
+            or result_obj.get("imageUrl")
+            or None
+        )
+        # Fallback: try to get image from the first holder's token metadata in their trade
+        if not token_image_url and top_holders:
+            first_h = top_holders[0]
+            first_meta = (
+                first_h.get("tokenMetadata")
+                or first_h.get("token")
+                or {}
+            )
+            token_image_url = (
+                first_meta.get("imageLargeUrl")
+                or first_meta.get("imageUrl")
+                or first_meta.get("image")
+                or None
+            )
         enriched = []
-        for uid, feed_item in list(seen.items())[:top_n * 3]:
-            try:
-                trade_data = self.get_user_trades_for_token(uid, token_address, limit=5)
-            except Exception:
-                trade_data = {}
+        for h in top_holders:
+            user = h.get("user", {})
+            uid = user.get("id", "")
+            value = float(h.get("value") or 0)
+            still_holding = value > 0
 
-            all_token_trades = (
-                [t["trade"] for t in trade_data.get("activeTrades", []) if "trade" in t]
-                + [t["trade"] for t in trade_data.get("closedTrades", []) if "trade" in t]
-            )
-
-            # Grab token image from first trade that has it
-            if not token_image_url and all_token_trades:
-                token_image_url = all_token_trades[0].get("tokenMetadata", {}).get("imageLargeUrl")
-
-            # Aggregate PnL across all positions for this token
-            realized = sum(float(t.get("realizedPnlUsd") or 0) for t in all_token_trades)
-            unrealized = sum(float(t.get("unrealizedPnlUsd") or 0) for t in all_token_trades)
-            cost_basis = sum(float(t.get("totalCostBasis") or 0) for t in all_token_trades)
-            still_holding = any(
-                float(t.get("humanTokenAmount") or 0) > 0 for t in all_token_trades
-            )
-
-            # Wallet addresses
-            solana_wallet = next(
-                (t.get("userAddress") for t in all_token_trades
-                 if t.get("networkId") == FOMO_NETWORK_IDS["solana"]), None
-            )
-            evm_wallet = next(
-                (t.get("userAddress") for t in all_token_trades
-                 if t.get("networkId") in (FOMO_NETWORK_IDS["base"], FOMO_NETWORK_IDS["bsc"])), None
-            )
+            # Wallet: use address field, falling back to evmAddress
+            sol_wallet = user.get("address") if network_id == FOMO_NETWORK_IDS["solana"] else None
+            evm_wallet = user.get("evmAddress") if network_id != FOMO_NETWORK_IDS["solana"] else None
+            if not sol_wallet and not evm_wallet:
+                sol_wallet = user.get("address")
 
             enriched.append({
                 "userId": uid,
-                "displayName": feed_item.get("displayName") or uid[:8],
-                "userHandle": feed_item.get("userHandle"),
-                "profilePictureLink": feed_item.get("profilePictureLink"),
+                "displayName": user.get("displayName") or user.get("userHandle") or uid[:8],
+                "userHandle": user.get("userHandle"),
+                "profilePictureLink": user.get("profilePictureLink"),
                 "networkId": network_id,
-                "solana_wallet": solana_wallet,
+                "solana_wallet": sol_wallet,
                 "evm_wallet": evm_wallet,
-                "realizedPnlUsd": realized,
-                "unrealizedPnlUsd": unrealized,
-                "totalCostBasis": cost_basis,
+                "realizedPnlUsd": float(h.get("realizedPnl") or 0),
+                "unrealizedPnlUsd": float(h.get("unrealizedPnl") or 0),
+                "totalCostBasis": float(h.get("costBasis") or 0),
+                "positionValue": value,
                 "stillHolding": still_holding,
-                "usdAmount": float(feed_item.get("usdAmount") or 0),
+                "tradeId": h.get("tradeId"),
+                "latestComment": h.get("comment"),
             })
 
-        # Sort by realized PnL descending, return top N
-        enriched.sort(key=lambda x: x["realizedPnlUsd"], reverse=True)
-        return enriched[:top_n], token_image_url
+        return enriched, token_image_url
+
+    def get_trade_comments(self, trade_id: str) -> list[dict[str, Any]]:
+        """
+        Fetch all comments for a trade position.
+
+        Each comment has: id, userId, tradeId, comment, createdAt,
+        numLikes, parentId, olderThesis, newerThesis
+        """
+        data = self.get(f"/trades/{trade_id}/comments")
+        return data.get("responseObject", {}).get("comments", [])
+
+    def get_token_comments(
+        self,
+        token_address: str,
+        network_id: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Get all holder comments for a token, enriched with user info.
+        Returns list of comment dicts with user display info attached.
+        """
+        import json as _json
+        tokens_param = _json.dumps([{"address": token_address, "networkId": network_id}])
+        data = self.get("/hodlers/top", params={"tokens": tokens_param})
+        results = data.get("responseObject", [])
+        if not results:
+            return []
+
+        comments_out = []
+        for h in results[0].get("topHolders", []):
+            trade_id = h.get("tradeId")
+            if not trade_id:
+                continue
+            user = h.get("user", {})
+            try:
+                comments = self.get_trade_comments(trade_id)
+            except Exception:
+                comments = []
+            for c in comments:
+                comments_out.append({
+                    "displayName": user.get("displayName") or user.get("userHandle", ""),
+                    "userHandle": user.get("userHandle"),
+                    "profilePictureLink": user.get("profilePictureLink"),
+                    "positionValue": float(h.get("value") or 0),
+                    "comment": c.get("comment", ""),
+                    "numLikes": c.get("numLikes", 0),
+                    "createdAt": c.get("createdAt", ""),
+                    "tradeId": trade_id,
+                    "commentId": c.get("id"),
+                })
+
+        # Sort by likes descending
+        comments_out.sort(key=lambda x: x["numLikes"], reverse=True)
+        return comments_out
 
     # ------------------------------------------------------------------
     # Leaderboard
